@@ -1,0 +1,14 @@
+.env
+.env.*
+!.env.example
+data/
+strm-output/
+__pycache__/
+**/__pycache__/
+*.pyc
+*.pyo
+*.bak
+.DS_Store
+Thumbs.db
+*.log
+
