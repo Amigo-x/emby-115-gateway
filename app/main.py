@@ -36,7 +36,7 @@ VIDEO_EXTS = {
     ".mov", ".mp4", ".mpeg", ".mpg", ".mts", ".rmvb", ".ts", ".vob", ".webm", ".wmv",
 }
 SUBTITLE_EXTS = {".ass", ".srt", ".ssa", ".sub", ".vtt"}
-PROBE_UA_WORDS = ("lavf", "ffmpeg", "ffprobe", "embyserver")
+PROBE_UA_WORDS = ("ffmpeg", "ffprobe", "embyserver")
 
 def env_int(name: str, default: int) -> int:
     try:
