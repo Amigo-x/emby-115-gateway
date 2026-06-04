@@ -587,6 +587,11 @@ def fit_path_for_fs(path: Path) -> Path:
     return Path(*(safe_fs_name(part) for part in path.parts))
 
 
+def strm_url(config: dict[str, Any], media_id: str, openlist_path: str) -> str:
+    source_name = quote(posixpath.basename(openlist_path))
+    return f"{str(config['gateway_public_base_url']).rstrip('/')}/strm/{quote(media_id)}/{source_name}?token={quote(str(config['static_token']))}"
+
+
 def write_strm(config: dict[str, Any], media_id: str, openlist_path: str, source: dict[str, str]) -> tuple[str, str]:
     emby_rel = output_rel_path(config, openlist_path, source, ".strm")
     if emby_rel is None:
@@ -600,11 +605,77 @@ def write_strm(config: dict[str, Any], media_id: str, openlist_path: str, source
     host_path = host_root / rel
     emby_path = posixpath.join(emby_root, emby_rel.as_posix()) if emby_root else rel.as_posix()
     host_path.parent.mkdir(parents=True, exist_ok=True)
-    source_name = quote(posixpath.basename(openlist_path))
-    content = f"{str(config['gateway_public_base_url']).rstrip('/')}/strm/{quote(media_id)}/{source_name}?token={quote(str(config['static_token']))}\n"
+    content = strm_url(config, media_id, openlist_path) + "\n"
     if not host_path.exists() or host_path.read_text(encoding="utf-8") != content:
         host_path.write_text(content, encoding="utf-8")
     return str(host_path), emby_path
+
+
+def rewrite_strm_urls(source_key: str | None = None) -> dict[str, Any]:
+    config = get_config(force=True)
+    started = now()
+    stats: dict[str, Any] = {
+        "status": "running",
+        "mode": "rewrite_strm_url",
+        "path": "all media" if not source_key else f"source:{source_key}",
+        "checked": 0,
+        "rewritten": 0,
+        "unchanged": 0,
+        "missing_files": 0,
+        "errors": 0,
+        "synced_at": started,
+    }
+    with db() as con:
+        cur = con.execute(
+            "insert into sync_log (started_at, status, path, mode) values (?, 'running', ?, 'rewrite_strm_url')",
+            (started, stats["path"]),
+        )
+        log_id = cur.lastrowid
+    try:
+        with sync_lock:
+            with db() as con:
+                if source_key:
+                    rows = con.execute(
+                        "select id, openlist_path, strm_path_host from media where source_key = ? order by name",
+                        (source_key,),
+                    ).fetchall()
+                else:
+                    rows = con.execute(
+                        "select id, openlist_path, strm_path_host from media order by name",
+                    ).fetchall()
+            output_root = Path(str(config.get("strm_output_dir") or STRM_OUTPUT_DIR)).resolve()
+            for row in rows:
+                stats["checked"] += 1
+                try:
+                    path = Path(row["strm_path_host"])
+                    resolved = path.resolve()
+                    if not resolved.is_relative_to(output_root) or not path.exists() or not path.is_file():
+                        stats["missing_files"] += 1
+                        continue
+                    content = strm_url(config, row["id"], row["openlist_path"]) + "\n"
+                    if path.read_text(encoding="utf-8") == content:
+                        stats["unchanged"] += 1
+                        continue
+                    path.write_text(content, encoding="utf-8")
+                    stats["rewritten"] += 1
+                except OSError:
+                    stats["errors"] += 1
+        stats.update({"status": "ok", "finished_at": now()})
+        with db() as con:
+            con.execute(
+                "update sync_log set finished_at = ?, status = 'ok', summary = ? where id = ?",
+                (now(), json.dumps(stats, ensure_ascii=False), log_id),
+            )
+        last_sync.clear()
+        last_sync.update(stats)
+        return stats
+    except Exception as exc:
+        stats.update({"status": "failed", "error": str(exc), "finished_at": now()})
+        with db() as con:
+            con.execute("update sync_log set finished_at = ?, status = 'failed', error = ? where id = ?", (now(), str(exc), log_id))
+        last_sync.clear()
+        last_sync.update(stats)
+        raise
 
 
 def upsert_media(config: dict[str, Any], item: dict[str, Any], openlist_path: str, source: dict[str, str], seen_at: int) -> bool:
@@ -1685,6 +1756,14 @@ def sync_page(request: Request) -> Response:
             </section>
             <button>开始同步</button>
           </form>
+          <form method="post" action="/admin/sync/rewrite-strm" class="form">
+            <section class="form-section">
+              <h2>重写 STRM URL</h2>
+              <p class="muted">仅刷新现有 STRM 文件中的网关地址和播放 Token，不扫描 OpenList，不获取 115 直链，不增删媒体记录。</p>
+              <label>媒体源<select name="source_key">{options}</select></label>
+            </section>
+            <button class="secondary">重写 STRM URL</button>
+          </form>
           <p>API 示例：<code>/admin-api/sync?token={token}&path=/Cloud/115/Media/Movies</code></p>
         </main>
         """,
@@ -1716,6 +1795,15 @@ def sync_run(request: Request, path: str = Form(""), source_key: str = Form(""),
     if isinstance(user, RedirectResponse):
         return user
     threading.Thread(target=lambda: sync_once(path=path or None, source_key=source_key or None, force=bool(force)), daemon=True).start()
+    return RedirectResponse("/admin", status_code=303)
+
+
+@app.post("/admin/sync/rewrite-strm")
+def sync_rewrite_strm(request: Request, source_key: str = Form("")) -> RedirectResponse:
+    user = require_page_user(request)
+    if isinstance(user, RedirectResponse):
+        return user
+    threading.Thread(target=lambda: rewrite_strm_urls(source_key=source_key or None), daemon=True).start()
     return RedirectResponse("/admin", status_code=303)
 
 
